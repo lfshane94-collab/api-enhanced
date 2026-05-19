@@ -1,11 +1,19 @@
-// 用户详情 H5 模拟版
+// 用户详情 H5 增强版
 // 路由：/user/detail/h5?uid=xxxx
+//
+// 作用：
+// 1. 请求用户基础信息
+// 2. 请求 H5 页面实际使用的 /weapi/user/tag/list
+// 3. 从 tags 里提取 specialCode === 'ip' 的 IP 属地
+// 4. 合并到 profile.ipLocation
 
 const createOption = require('../util/option.js')
 
-const MOBILE_UA =
-  'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) ' +
-  'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 ' +
+const INTERFACE_DOMAIN = 'https://interface.music.163.com'
+
+const MOBILE_H5_UA =
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 16_2 like Mac OS X) ' +
+  'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.2 ' +
   'Mobile/15E148 Safari/604.1'
 
 function parseCookie(cookie) {
@@ -21,265 +29,285 @@ function parseCookie(cookie) {
     .filter(Boolean)
     .reduce((obj, item) => {
       const index = item.indexOf('=')
+
       if (index === -1) return obj
 
       const key = item.slice(0, index).trim()
       const value = item.slice(index + 1).trim()
 
       if (key) obj[key] = value
+
       return obj
     }, {})
 }
 
-function normalizeIpLocation(value) {
-  if (!value) return ''
+function mergeCookie(option, query) {
+  const envCookie = parseCookie(process.env.NCM_COOKIE || '')
+  const optionCookie = parseCookie(option.cookie || {})
+  const queryCookie = parseCookie(query.cookie || '')
 
-  if (typeof value === 'string') {
-    return value
-      .replace(/^IP属地[:：]?\s*/i, '')
-      .replace(/^IP[:：]?\s*/i, '')
-      .trim()
+  return {
+    ...envCookie,
+    ...optionCookie,
+    ...queryCookie,
   }
-
-  if (typeof value === 'object') {
-    return (
-      value.location ||
-      value.province ||
-      value.city ||
-      value.region ||
-      value.country ||
-      ''
-    )
-  }
-
-  return ''
-}
-
-function findIpLocation(obj, depth = 0) {
-  if (!obj || typeof obj !== 'object' || depth > 8) return ''
-
-  if (Object.prototype.hasOwnProperty.call(obj, 'ipLocation')) {
-    const result = normalizeIpLocation(obj.ipLocation)
-    if (result) return result
-  }
-
-  const likelyKeys = [
-    'profile',
-    'userProfile',
-    'userInfo',
-    'user',
-    'data',
-    'homePage',
-    'homepage',
-    'account',
-  ]
-
-  for (const key of likelyKeys) {
-    if (obj[key]) {
-      const result = findIpLocation(obj[key], depth + 1)
-      if (result) return result
-    }
-  }
-
-  if (depth <= 3) {
-    for (const key in obj) {
-      if (obj[key] && typeof obj[key] === 'object') {
-        const result = findIpLocation(obj[key], depth + 1)
-        if (result) return result
-      }
-    }
-  }
-
-  return ''
 }
 
 function getBody(res) {
   return res && res.body ? res.body : res
 }
 
-function makeH5Option(query, uid, apiPath, cookie, crypto = 'eapi') {
-  const option = createOption(
-    {
-      ...query,
-      cookie,
-      ua: 'mobile',
-    },
-    crypto,
-  )
+function errorMessage(error) {
+  if (!error) return '未知错误'
 
-  option.crypto = crypto
-  option.ua = 'mobile'
+  if (error.body) {
+    return (
+      error.body.msg ||
+      error.body.message ||
+      error.body.error ||
+      JSON.stringify(error.body)
+    )
+  }
 
-  /**
-   * eapi 加密时使用的接口路径。
-   * 对于 interface.music.163.com/eapi/xxx，
-   * 这里通常要写成 /api/xxx。
-   */
-  option.url = apiPath
+  return error.message || String(error)
+}
 
-  /**
-   * 注意：
-   * 如果你的 util/request.js 没有合并 options.headers，
-   * 这里的 headers 不会生效。
-   * 下面第二部分会讲怎么改 request.js。
-   */
+function extractIpFromTagList(body) {
+  const tags =
+    body?.data?.tags ||
+    body?.tags ||
+    body?.result?.data?.tags ||
+    []
+
+  if (!Array.isArray(tags)) return ''
+
+  const ipTag = tags.find((tag) => {
+    const specialCode = String(tag?.specialCode || '').toLowerCase()
+    const name = String(tag?.name || '')
+
+    return specialCode === 'ip' || /^IP\s*[:：]/i.test(name)
+  })
+
+  if (!ipTag) return ''
+
+  const name = String(ipTag.name || '')
+
+  const match =
+    name.match(/^IP\s*[:：]\s*(.+)$/i) ||
+    name.match(/^IP属地\s*[:：]\s*(.+)$/i)
+
+  if (match && match[1]) {
+    return match[1].trim()
+  }
+
+  return name
+    .replace(/^IP\s*[:：]\s*/i, '')
+    .replace(/^IP属地\s*[:：]\s*/i, '')
+    .trim()
+}
+
+function injectIpLocationToDetail(detailBody, ipLocation) {
+  if (!detailBody || typeof detailBody !== 'object' || !ipLocation) {
+    return detailBody
+  }
+
+  if (detailBody.profile && typeof detailBody.profile === 'object') {
+    detailBody.profile.ipLocation = {
+      location: ipLocation,
+      source: 'user_tag_list',
+    }
+
+    return detailBody
+  }
+
+  if (
+    detailBody.data &&
+    detailBody.data.profile &&
+    typeof detailBody.data.profile === 'object'
+  ) {
+    detailBody.data.profile.ipLocation = {
+      location: ipLocation,
+      source: 'user_tag_list',
+    }
+
+    return detailBody
+  }
+
+  detailBody.ipLocation = {
+    location: ipLocation,
+    source: 'user_tag_list',
+  }
+
+  return detailBody
+}
+
+async function fetchDetail(query, request, uid) {
+  const option = createOption(query, 'eapi')
+
+  option.cookie = mergeCookie(option, query)
+
+  option.cookie.os = option.cookie.os || 'iPhone OS'
+  option.cookie.osver = option.cookie.osver || '16.2'
+  option.cookie.appver = option.cookie.appver || '9.1.70'
+  option.cookie.channel = option.cookie.channel || 'distribution'
+
+  option.ua = MOBILE_H5_UA
+
   option.headers = {
     ...(option.headers || {}),
-    'User-Agent': MOBILE_UA,
     Referer: `https://y.music.163.com/m/user?id=${uid}`,
     Origin: 'https://y.music.163.com',
     Accept: 'application/json, text/plain, */*',
     'Accept-Language': 'zh-CN,zh;q=0.9',
+    'User-Agent': MOBILE_H5_UA,
+  }
+
+  const data = {
+    all: 'true',
+    userId: uid,
+    csrf_token: option.cookie.__csrf || '',
+  }
+
+  return request(`/api/w/v1/user/detail/${uid}`, data, option)
+}
+
+async function fetchUserTagList(query, request, uid) {
+  const option = createOption(query, 'weapi')
+
+  option.domain = INTERFACE_DOMAIN
+  option.cookie = mergeCookie(option, query)
+  option.ua = MOBILE_H5_UA
+  option.e_r = false
+
+  const csrf = option.cookie.__csrf || query.csrf_token || ''
+
+  option.headers = {
+    ...(option.headers || {}),
+    Referer: `https://y.music.163.com/m/user?id=${uid}`,
+    Origin: 'https://y.music.163.com',
+    Accept: 'application/json, text/plain, */*',
+    'Accept-Language': 'zh-CN,zh;q=0.9',
+    'User-Agent': MOBILE_H5_UA,
     'X-Requested-With': 'XMLHttpRequest',
   }
 
-  return option
+  /**
+   * 你抓到的是：
+   * https://interface.music.163.com/weapi/user/tag/list?csrf_token=xxx
+   *
+   * 在这个 request.js 里，weapi 应该传 /api/user/tag/list，
+   * request.js 会自动转换成 /weapi/user/tag/list。
+   */
+  const uri = `/api/user/tag/list${
+    csrf ? `?csrf_token=${encodeURIComponent(csrf)}` : ''
+  }`
+
+  /**
+   * H5 页面实际请求里目标用户 ID 应该在加密后的 body 里。
+   * 这里使用 userId。
+   */
+  const data = {
+    userId: uid,
+    csrf_token: csrf,
+  }
+
+  return request(uri, data, option)
 }
 
 module.exports = async (query, request) => {
-  const uid = String(query.uid || '').trim()
+  const uid = String(query.uid || query.userId || '').trim()
 
   if (!/^\d+$/.test(uid)) {
     return {
-      code: 400,
-      msg: 'uid 参数错误',
+      status: 400,
+      body: {
+        code: 400,
+        msg: 'uid 参数错误',
+      },
+      cookie: [],
     }
   }
 
-  /**
-   * 不建议把 Cookie 写在前端传过来。
-   * 如果需要 Cookie，建议在服务端环境变量里配置：
-   *
-   * NCM_COOKIE="MUSIC_U=xxx; __csrf=xxx"
-   */
-  const envCookie = parseCookie(process.env.NCM_COOKIE || '')
-  const queryCookie = parseCookie(query.cookie || '')
-  const cookie = {
-    ...envCookie,
-    ...queryCookie,
+  let detailRes = null
+  let detailBody = null
+  let tagBody = null
+  let ipLocation = ''
+  let detailError = ''
+  let tagError = ''
+
+  try {
+    detailRes = await fetchDetail(query, request, uid)
+    detailBody = getBody(detailRes)
+  } catch (error) {
+    detailError = errorMessage(error)
+  }
+
+  try {
+    const tagRes = await fetchUserTagList(query, request, uid)
+    tagBody = getBody(tagRes)
+    ipLocation = extractIpFromTagList(tagBody)
+  } catch (error) {
+    tagError = errorMessage(error)
   }
 
   /**
-   * 模拟移动端环境。
+   * debug=1 时，返回详细调试信息，方便确认 IP 是否来自 tag/list。
    */
-  cookie.os = cookie.os || 'ios'
-  cookie.appver = cookie.appver || '9.1.70'
-  cookie.channel = cookie.channel || 'netease'
-
-  /**
-   * 这里先尝试几个可能的 H5 / eapi 形式。
-   * 如果你之后在浏览器 Network 里抓到了真正接口，
-   * 主要就是改这里的 targets。
-   */
-  const targets = [
-    {
-      name: 'h5-w-detail-relative',
-      apiPath: `/api/w/v1/user/detail/${uid}`,
-      requestUrl: `/api/w/v1/user/detail/${uid}`,
-      crypto: 'eapi',
-      data: {
-        all: 'true',
-        userId: uid,
-        csrf_token: cookie.__csrf || '',
-      },
-    },
-    {
-      name: 'h5-w-detail-interface',
-      apiPath: `/api/w/v1/user/detail/${uid}`,
-      requestUrl: `https://interface.music.163.com/eapi/w/v1/user/detail/${uid}`,
-      crypto: 'eapi',
-      data: {
-        all: 'true',
-        userId: uid,
-        csrf_token: cookie.__csrf || '',
-      },
-    },
-    {
-      name: 'h5-v1-detail-interface',
-      apiPath: `/api/v1/user/detail/${uid}`,
-      requestUrl: `https://interface.music.163.com/eapi/v1/user/detail/${uid}`,
-      crypto: 'eapi',
-      data: {
-        csrf_token: cookie.__csrf || '',
-      },
-    },
-  ]
-
-  let firstResult = null
-  let firstBody = null
-  const attempts = []
-
-  for (const target of targets) {
-    try {
-      const option = makeH5Option(
-        query,
-        uid,
-        target.apiPath,
-        cookie,
-        target.crypto,
-      )
-
-      const res = await request(target.requestUrl, target.data, option)
-      const body = getBody(res)
-      const ipLocation = findIpLocation(body)
-
-      attempts.push({
-        name: target.name,
-        code: body && body.code,
-        ipLocation,
-      })
-
-      if (!firstResult) {
-        firstResult = res
-        firstBody = body
-      }
-
-      /**
-       * 如果某个接口拿到了 IP 属地，直接返回这个结果。
-       */
-      if (ipLocation) {
-        if (String(query.debug) === '1') {
-          return {
-            code: 200,
-            uid,
-            selected: target.name,
-            ipLocation,
-            attempts,
-            result: body,
-          }
-        }
-
-        return res
-      }
-    } catch (error) {
-      attempts.push({
-        name: target.name,
-        error: error.message || String(error),
-      })
-    }
-  }
-
-  /**
-   * 没拿到 IP，但至少有接口返回了用户信息。
-   */
-  if (firstResult) {
-    if (String(query.debug) === '1') {
-      return {
+  if (String(query.debug) === '1') {
+    return {
+      status: 200,
+      body: {
         code: 200,
         uid,
-        msg: '接口可用，但没有找到 ipLocation',
-        attempts,
-        result: firstBody,
-      }
+        ipLocation,
+        detailError,
+        tagError,
+        detail: detailBody,
+        tagList: tagBody,
+      },
+      cookie: detailRes?.cookie || [],
     }
+  }
 
-    return firstResult
+  /**
+   * 如果 detail 成功，则把 IP 合并进去再返回。
+   */
+  if (detailRes && detailBody) {
+    injectIpLocationToDetail(detailBody, ipLocation)
+
+    return detailRes
+  }
+
+  /**
+   * 如果 detail 失败，但 tag/list 拿到了 IP，也返回一个可识别结构。
+   */
+  if (ipLocation) {
+    return {
+      status: 200,
+      body: {
+        code: 200,
+        profile: {
+          userId: Number(uid),
+          ipLocation: {
+            location: ipLocation,
+            source: 'user_tag_list',
+          },
+        },
+        tagList: tagBody,
+      },
+      cookie: [],
+    }
   }
 
   return {
-    code: 502,
-    uid,
-    msg: 'H5 模拟请求失败',
-    attempts,
+    status: 502,
+    body: {
+      code: 502,
+      uid,
+      msg: 'H5 用户详情和用户标签均获取失败',
+      detailError,
+      tagError,
+    },
+    cookie: [],
   }
 }
